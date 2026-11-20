@@ -22,6 +22,7 @@ from .geometry import (
     parse_polygon,
     plan_change,
 )
+from . import rounding
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -57,11 +58,46 @@ CREATE TABLE IF NOT EXISTS txn_items (
     geom_wkt  TEXT NOT NULL,
     area      REAL NOT NULL
 );
+-- 分项面积整数表：每个地籍版本最多一张（version 唯一）。
+-- 行 = 宗地（含锁定标志），格 = 宗地 × 地类（缺项按 0 也落库），
+-- 列合计 = 资料员录入值。勘误整体重写明细与整数，锁定行保留原数。
+CREATE TABLE IF NOT EXISTS round_tables (
+    table_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    version    INTEGER NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS round_rows (
+    table_id        INTEGER NOT NULL REFERENCES round_tables(table_id),
+    parcel_id       TEXT NOT NULL,
+    registered_area REAL NOT NULL,
+    row_total       INTEGER NOT NULL,
+    locked          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (table_id, parcel_id)
+);
+CREATE TABLE IF NOT EXISTS round_cells (
+    table_id   INTEGER NOT NULL REFERENCES round_tables(table_id),
+    parcel_id  TEXT NOT NULL,
+    land_class TEXT NOT NULL,
+    orig_area  REAL NOT NULL,
+    int_area   INTEGER NOT NULL,
+    PRIMARY KEY (table_id, parcel_id, land_class)
+);
+CREATE TABLE IF NOT EXISTS round_totals (
+    table_id   INTEGER NOT NULL REFERENCES round_tables(table_id),
+    land_class TEXT NOT NULL,
+    total      INTEGER NOT NULL,
+    PRIMARY KEY (table_id, land_class)
+);
 """
 
 
 class VersionConflictError(Exception):
     """base_version 与当前版本不一致（竞争提交的失败者）。"""
+
+
+class RoundNotFoundError(Exception):
+    """该地籍版本尚未建立整数表。"""
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -384,3 +420,259 @@ def commit_change(conn: sqlite3.Connection, req: dict) -> dict:
         "new_ids": [nid for nid, _ in new_items],
         "report": report.to_dict(),
     }
+
+
+# ---------------------------------------------------------------- 整数表
+
+def snapshot_parcels(conn: sqlite3.Connection, version: int) -> list[dict]:
+    """某版登记面积清单（宗地号 + 面积），按宗地号排序。"""
+    return [
+        {"parcel_id": p["parcel_id"], "area": p["area"]}
+        for p in snapshot_at(conn, version)
+    ]
+
+
+def check_version(conn: sqlite3.Connection, version) -> None:
+    cur = current_version(conn)
+    if cur < 1:
+        raise PlanValidationError("现势库为空，请先导入宗地")
+    if not isinstance(version, int) or isinstance(version, bool) or not 1 <= version <= cur:
+        raise PlanValidationError(f"版本号须为 1..{cur} 的整数")
+
+
+def check_round_details(conn: sqlite3.Connection, version, csv_text):
+    """预校验明细 CSV（不落库）：版本 + 宗地集合 + 每宗分项和。"""
+    check_version(conn, version)
+    snap = snapshot_parcels(conn, version)
+    cells, _parcels, classes = rounding.parse_area_csv(csv_text)
+    rounding.validate_details(cells, snap)
+    return snap, cells, classes
+
+
+def _prepare_round_input(conn: sqlite3.Connection, version, csv_text, totals):
+    """公共校验：版本号、CSV 明细、地类合计。返回求解所需的全部结构。"""
+    snap, cells, classes = check_round_details(conn, version, csv_text)
+    totals_map = rounding.validate_totals(totals, classes)
+    row_targets = {p["parcel_id"]: rounding.round_half_up(p["area"]) for p in snap}
+    return snap, cells, classes, totals_map, row_targets
+
+
+def _write_round_rows(conn, table_id, snap, cells, classes, totals_map,
+                      row_targets, result, locked_rows):
+    """整表重写行/格/合计（建表与勘误共用，须在事务内调用）。"""
+    for p in snap:
+        pid = p["parcel_id"]
+        conn.execute(
+            "INSERT INTO round_rows (table_id, parcel_id, registered_area, row_total, locked) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (table_id, pid, p["area"], row_targets[pid], 1 if pid in locked_rows else 0),
+        )
+        for cls in classes:
+            conn.execute(
+                "INSERT INTO round_cells (table_id, parcel_id, land_class, orig_area, int_area) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (table_id, pid, cls, cells.get((pid, cls), 0.0), result[(pid, cls)]),
+            )
+    for cls in classes:
+        conn.execute(
+            "INSERT INTO round_totals (table_id, land_class, total) VALUES (?, ?, ?)",
+            (table_id, cls, totals_map[cls]),
+        )
+
+
+def create_round_table(conn: sqlite3.Connection, version, csv_text, totals) -> dict:
+    """为某版地籍建立整数表：校验 → 求解 → 原子写入。每版仅一张。"""
+    snap, cells, classes, totals_map, row_targets = _prepare_round_input(
+        conn, version, csv_text, totals
+    )
+    result = rounding.solve_integer_table(
+        cells, [p["parcel_id"] for p in snap], classes, row_targets, totals_map
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute(
+            "SELECT 1 FROM round_tables WHERE version = ?", (version,)
+        ).fetchone():
+            raise VersionConflictError(f"v{version} 已建立整数表，如需修正请使用勘误")
+        now = _now()
+        cur = conn.execute(
+            "INSERT INTO round_tables (version, created_at, updated_at) VALUES (?, ?, ?)",
+            (version, now, now),
+        )
+        _write_round_rows(
+            conn, cur.lastrowid, snap, cells, classes, totals_map,
+            row_targets, result, set(),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_round_table(conn, version)
+
+
+def get_round_table(conn: sqlite3.Connection, version: int) -> dict:
+    t = conn.execute(
+        "SELECT * FROM round_tables WHERE version = ?", (version,)
+    ).fetchone()
+    if t is None:
+        raise RoundNotFoundError(f"v{version} 尚未建立整数表")
+    tid = t["table_id"]
+    rows = conn.execute(
+        "SELECT * FROM round_rows WHERE table_id = ? ORDER BY parcel_id", (tid,)
+    ).fetchall()
+    cells = conn.execute(
+        "SELECT parcel_id, land_class, orig_area, int_area FROM round_cells "
+        "WHERE table_id = ?",
+        (tid,),
+    ).fetchall()
+    totals = conn.execute(
+        "SELECT land_class, total FROM round_totals WHERE table_id = ? ORDER BY rowid",
+        (tid,),
+    ).fetchall()
+    classes = [r["land_class"] for r in totals]
+    cell_map = {(c["parcel_id"], c["land_class"]): c for c in cells}
+    return {
+        "version": version,
+        "created_at": t["created_at"],
+        "updated_at": t["updated_at"],
+        "land_classes": classes,
+        "totals": {r["land_class"]: r["total"] for r in totals},
+        "rows": [
+            {
+                "parcel_id": r["parcel_id"],
+                "registered_area": r["registered_area"],
+                "row_total": r["row_total"],
+                "locked": bool(r["locked"]),
+                "cells": {
+                    cls: {
+                        "orig": cell_map[(r["parcel_id"], cls)]["orig_area"],
+                        "int": cell_map[(r["parcel_id"], cls)]["int_area"],
+                    }
+                    for cls in classes
+                },
+            }
+            for r in rows
+        ],
+        "grand_total": sum(r["row_total"] for r in rows),
+    }
+
+
+def errata_round_table(conn: sqlite3.Connection, version: int, csv_text, totals) -> dict:
+    """勘误：替换明细并重解。锁定行保留原数，其余格子改动数最少。
+
+    整个「读旧表 → 校验 → 求解 → 重写」在 IMMEDIATE 事务内完成；
+    校验失败或无解时整体回滚，原明细与整数表保持不变。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        t = conn.execute(
+            "SELECT * FROM round_tables WHERE version = ?", (version,)
+        ).fetchone()
+        if t is None:
+            raise RoundNotFoundError(f"v{version} 尚未建立整数表，请先建表")
+        tid = t["table_id"]
+        snap, cells, classes, totals_map, row_targets = _prepare_round_input(
+            conn, version, csv_text, totals
+        )
+        prev: dict[tuple[str, str], int] = {}
+        locked_rows: set[str] = set()
+        for r in conn.execute(
+            "SELECT parcel_id, locked FROM round_rows WHERE table_id = ?", (tid,)
+        ).fetchall():
+            if r["locked"]:
+                locked_rows.add(r["parcel_id"])
+        for c in conn.execute(
+            "SELECT parcel_id, land_class, int_area FROM round_cells WHERE table_id = ?",
+            (tid,),
+        ).fetchall():
+            prev[(c["parcel_id"], c["land_class"])] = c["int_area"]
+
+        result = rounding.solve_integer_table(
+            cells, [p["parcel_id"] for p in snap], classes, row_targets, totals_map,
+            prev=prev, fixed_rows=locked_rows,
+        )
+        changed = sum(1 for k, v in result.items() if v != prev.get(k, 0))
+
+        conn.execute("DELETE FROM round_cells WHERE table_id = ?", (tid,))
+        conn.execute("DELETE FROM round_totals WHERE table_id = ?", (tid,))
+        conn.execute("DELETE FROM round_rows WHERE table_id = ?", (tid,))
+        _write_round_rows(
+            conn, tid, snap, cells, classes, totals_map,
+            row_targets, result, locked_rows,
+        )
+        conn.execute(
+            "UPDATE round_tables SET updated_at = ? WHERE table_id = ?", (_now(), tid)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    out = get_round_table(conn, version)
+    out["changed_cells"] = changed
+    return out
+
+
+def set_round_lock(conn: sqlite3.Connection, version: int, parcel_id, locked, expected) -> dict:
+    """锁定 / 解锁一行。expected 为页面当前显示的整行整数（乐观并发）：
+    与库中不一致说明该行的数字已变，拒绝并返回 409。"""
+    if not isinstance(locked, bool):
+        raise GeoValidationError("locked 必须是布尔值")
+    if not isinstance(parcel_id, str) or not parcel_id.strip():
+        raise GeoValidationError("parcel_id 不能为空")
+    if not isinstance(expected, dict):
+        raise GeoValidationError("expected 必须是 {地类: 整数} 对象")
+    want: dict[str, int] = {}
+    for k, v in expected.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not float(v).is_integer():
+            raise GeoValidationError(f"expected[{k!r}] 必须是整数")
+        want[str(k)] = int(v)
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        t = conn.execute(
+            "SELECT * FROM round_tables WHERE version = ?", (version,)
+        ).fetchone()
+        if t is None:
+            raise RoundNotFoundError(f"v{version} 尚未建立整数表")
+        tid = t["table_id"]
+        row = conn.execute(
+            "SELECT 1 FROM round_rows WHERE table_id = ? AND parcel_id = ?",
+            (tid, parcel_id),
+        ).fetchone()
+        if row is None:
+            raise PlanValidationError(f"宗地 {parcel_id} 不在 v{version} 整数表中")
+        current = {
+            c["land_class"]: c["int_area"]
+            for c in conn.execute(
+                "SELECT land_class, int_area FROM round_cells "
+                "WHERE table_id = ? AND parcel_id = ?",
+                (tid, parcel_id),
+            ).fetchall()
+        }
+        if current != want:
+            raise VersionConflictError(
+                f"宗地 {parcel_id} 的整数已变化（他人已勘误或改动），"
+                "请刷新整数表后再锁定"
+            )
+        conn.execute(
+            "UPDATE round_rows SET locked = ? WHERE table_id = ? AND parcel_id = ?",
+            (1 if locked else 0, tid, parcel_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return get_round_table(conn, version)
+
+
+def list_round_versions(conn: sqlite3.Connection) -> list[dict]:
+    cur = current_version(conn)
+    have = {r["version"] for r in conn.execute("SELECT version FROM round_tables")}
+    return [
+        {"version": v, "parcel_count": len(snapshot_at(conn, v)), "has_table": v in have}
+        for v in range(1, cur + 1)
+    ]
+
+
+def round_table_csv(conn: sqlite3.Connection, version: int) -> str:
+    return rounding.build_table_csv(get_round_table(conn, version))

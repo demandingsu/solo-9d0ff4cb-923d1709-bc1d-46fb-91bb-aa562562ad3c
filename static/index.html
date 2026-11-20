@@ -44,6 +44,15 @@
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
   .txn-link { color: #1f4e79; cursor: pointer; text-decoration: underline; }
+  select { width: 100%; border: 1px solid #b6c2cf; border-radius: 6px; padding: 7px; font-size: 13px; background: #fff; }
+  td.num, th.num { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  tr.locked td { background: #fdf6e3; }
+  .lockbtn { padding: 2px 10px; font-size: 12px; border: 1px solid #1f4e79; background: #fff; color: #1f4e79; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+  .lockbtn.on { background: #b45309; border-color: #b45309; color: #fff; }
+  .orig { color: #7b8794; font-size: 11px; }
+  .wrap.roundMode { grid-template-columns: 1fr; }
+  .wrap.roundMode .mapPanel { display: none; }
+  input[type=file] { font-size: 12px; margin: 6px 0; }
 </style>
 </head>
 <body>
@@ -57,6 +66,7 @@
       <button id="tabImport" class="active" onclick="showTab('import')">导入</button>
       <button id="tabChange" onclick="showTab('change')">变更</button>
       <button id="tabQuery" onclick="showTab('query')">查询</button>
+      <button id="tabRound" onclick="showTab('round')">整数表</button>
     </div>
 
     <!-- 导入 -->
@@ -105,9 +115,20 @@
       <div id="txnList"></div>
       <div id="txnDetail"></div>
     </section>
+
+    <!-- 整数表 -->
+    <section id="paneRound" class="hidden">
+      <h2>分项面积整数表（图册排版）</h2>
+      <div class="row">
+        <select id="roundVersionSel" onchange="openRoundVersion(parseInt(this.value,10))"></select>
+        <button class="action" style="width:90px" onclick="initRoundTab()">刷新</button>
+      </div>
+      <div id="roundMsg"></div>
+      <div id="roundBody"></div>
+    </section>
   </div>
 
-  <div class="panel" style="padding:10px">
+  <div class="panel mapPanel" style="padding:10px">
     <svg id="map" xmlns="http://www.w3.org/2000/svg"></svg>
     <div class="legend">
       <span><i class="swatch" style="background:#bcd9f5"></i>现势宗地</span>
@@ -127,10 +148,12 @@ let state = { version: 0, parcels: [] };
 let lastPlan = null;
 
 function showTab(name) {
-  for (const t of ["Import", "Change", "Query"]) {
+  for (const t of ["Import", "Change", "Query", "Round"]) {
     document.getElementById("pane" + t).classList.toggle("hidden", t.toLowerCase() !== name);
     document.getElementById("tab" + t).classList.toggle("active", t.toLowerCase() === name);
   }
+  document.querySelector(".wrap").classList.toggle("roundMode", name === "round");
+  if (name === "round") initRoundTab();
 }
 
 function setMsg(id, cls, text) {
@@ -142,8 +165,16 @@ function setMsg(id, cls, text) {
 async function api(path, opts) {
   const resp = await fetch(path, opts);
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+  if (!resp.ok) {
+    const err = new Error((data.error || "请求失败") + "：" + (data.detail || resp.status));
+    err.status = resp.status;
+    throw err;
+  }
   return data;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 }
 
 async function refreshState() {
@@ -368,7 +399,194 @@ async function loadTxn(id) {
   } catch (e) { document.getElementById("txnDetail").innerHTML = `<div class="msg err">${e.message}</div>`; }
 }
 
-refreshState().catch(() => {});
-</script>
+/* ---------- 整数表（分项面积取整） ---------- */
+let roundTable = null;   // 当前打开的整数表
+let roundCreate = null;  // 建表模式：{preview, check}
+let roundErrata = null;  // 勘误预校验结果
+
+async function initRoundTab() {
+  setMsg("roundMsg", "");
+  document.getElementById("roundBody").innerHTML = "";
+  try {
+    const r = await api("/api/round/versions");
+    const sel = document.getElementById("roundVersionSel");
+    if (!r.versions.length) {
+      sel.innerHTML = "";
+      document.getElementById("roundBody").innerHTML =
+        '<p class="muted">现势库为空，请先在「导入」页导入宗地。</p>';
+      return;
+    }
+    const cur = parseInt(sel.value, 10);
+    sel.innerHTML = r.versions.map(v =>
+      `<option value="${v.version}">v${v.version}（${v.parcel_count} 宗${v.has_table ? "，已建表" : ""}）</option>`).join("");
+    const keep = r.versions.some(v => v.version === cur);
+    sel.value = keep ? cur : r.versions[r.versions.length - 1].version;
+    await openRoundVersion(parseInt(sel.value, 10));
+  } catch (e) { setMsg("roundMsg", "err", e.message); }
+}
+
+async function openRoundVersion(v) {
+  if (!v) return;
+  setMsg("roundMsg", "");
+  roundTable = null; roundCreate = null; roundErrata = null;
+  try {
+    roundTable = await api("/api/round/" + v);
+  } catch (e) {
+    if (e.status === 404) {
+      try { roundCreate = { preview: await api("/api/round/preview/" + v), check: null }; }
+      catch (e2) { setMsg("roundMsg", "err", e2.message); }
+    } else {
+      setMsg("roundMsg", "err", e.message);
+    }
+  }
+  renderRound();
+}
+
+function renderRound() {
+  const body = document.getElementById("roundBody");
+  if (roundTable) { body.innerHTML = roundTableHtml(); return; }
+  if (!roundCreate) { body.innerHTML = ""; return; }
+  const p = roundCreate.preview;
+  body.innerHTML =
+    `<h2>为 v${p.version} 建立整数表</h2>
+     <p class="muted">该版共 ${p.parcels.length} 宗。上传 CSV（表头：宗地号,地类,面积），缺项按 0 计；
+     每宗原始分项之和须等于该版登记面积；行合计取登记面积四舍五入，列合计取录入值。</p>
+     <table><tr><th>宗地号</th><th class="num">登记面积</th><th class="num">行合计（四舍五入）</th></tr>` +
+    p.parcels.map(x =>
+      `<tr><td>${esc(x.parcel_id)}</td><td class="num">${x.area}</td><td class="num">${Math.floor(x.area + 0.5)}</td></tr>`).join("") +
+    `</table>
+     <h2>上传分项面积 CSV</h2>
+     <input type="file" accept=".csv,text/csv" onchange="readCsvFile(this,'createCsvText')">
+     <textarea id="createCsvText" placeholder="宗地号,地类,面积&#10;P1,耕地,60.5"></textarea>
+     <button class="action" onclick="doRoundCheck()">解析并校验 CSV</button>
+     <div id="createCheck"></div>`;
+}
+
+function roundTableHtml() {
+  const t = roundTable;
+  let html =
+    `<h2>v${t.version} 整数表 <span class="muted">更新于 ${t.updated_at}</span></h2>
+     <table><tr><th>宗地号</th>${t.land_classes.map(c => `<th class="num">${esc(c)}</th>`).join("")}
+     <th class="num">行合计</th><th class="num">登记面积</th><th>排版锁定</th></tr>`;
+  t.rows.forEach((r, i) => {
+    html += `<tr class="${r.locked ? "locked" : ""}"><td>${esc(r.parcel_id)}</td>` +
+      t.land_classes.map(c => {
+        const cell = r.cells[c];
+        return `<td class="num">${cell.int}<div class="orig">${cell.orig}</div></td>`;
+      }).join("") +
+      `<td class="num"><b>${r.row_total}</b></td><td class="num">${r.registered_area}</td>` +
+      `<td><button class="lockbtn ${r.locked ? "on" : ""}" onclick="toggleLock(${i})">${r.locked ? "已锁定" : "锁定"}</button></td></tr>`;
+  });
+  html += `<tr><td><b>列合计</b></td>${t.land_classes.map(c => `<td class="num"><b>${t.totals[c]}</b></td>`).join("")}
+     <td class="num"><b>${t.grand_total}</b></td><td></td><td></td></tr></table>
+     <button class="action" onclick="downloadRound()">下载整数表 CSV</button>
+     <h2>勘误（替换明细）</h2>
+     <p class="muted">上传新 CSV 与各地类整数合计；锁定行保留原数，其余格子以改动最少为原则重排。
+     校验失败或无解时，原明细与整数表保持不变。</p>
+     <input type="file" accept=".csv,text/csv" onchange="readCsvFile(this,'errataCsvText')">
+     <textarea id="errataCsvText" placeholder="宗地号,地类,面积"></textarea>
+     <button class="action" onclick="doErrataCheck()">解析并校验新明细</button>
+     <div id="errataCheck"></div>`;
+  return html;
+}
+
+function checkHtml(chk, mode) {
+  let html = `<div class="msg ok">明细校验通过：${chk.parcels.length} 宗、地类 ${chk.land_classes.length} 类，各宗分项和均等于登记面积。请录入各地类整数合计：</div>`;
+  html += chk.land_classes.map((c, i) =>
+    `<label>「${esc(c)}」整数合计</label><input type="number" min="0" step="1" class="tot-in" data-mode="${mode}" data-idx="${i}">`).join("");
+  const fn = mode === "create" ? "doRoundCreate()" : "doRoundErrata()";
+  const label = mode === "create" ? "生成整数表" : "提交勘误（锁定行保留原数）";
+  html += `<button class="action ok" onclick='${fn}'>${label}</button>`;
+  return html;
+}
+
+function readTotals(mode, classes) {
+  const t = {};
+  document.querySelectorAll(`.tot-in[data-mode="${mode}"]`).forEach(el => {
+    const cls = classes[parseInt(el.dataset.idx, 10)];
+    if (el.value === "") throw new Error(`请填写地类「${cls}」的整数合计`);
+    t[cls] = Number(el.value);
+  });
+  return t;
+}
+
+function readCsvFile(input, targetId) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { document.getElementById(targetId).value = rd.result; };
+  rd.readAsText(f, "UTF-8");
+}
+
+async function doRoundCheck() {
+  const v = roundCreate.preview.version;
+  try {
+    const chk = await api("/api/round/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version: v, csv: document.getElementById("createCsvText").value }) });
+    roundCreate.check = chk;
+    document.getElementById("createCheck").innerHTML = checkHtml(chk, "create");
+  } catch (e) {
+    document.getElementById("createCheck").innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+  }
+}
+
+async function doRoundCreate() {
+  const v = roundCreate.preview.version;
+  let totals;
+  try { totals = readTotals("create", roundCreate.check.land_classes); }
+  catch (e) { return setMsg("roundMsg", "warn", e.message); }
+  try {
+    roundTable = await api("/api/round/create", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version: v, csv: document.getElementById("createCsvText").value, totals }) });
+    roundCreate = null;
+    setMsg("roundMsg", "ok", `v${v} 整数表已生成。`);
+    renderRound();
+  } catch (e) { setMsg("roundMsg", "err", e.message + "\n（未建表，可修正后重试）"); }
+}
+
+async function doErrataCheck() {
+  try {
+    const chk = await api("/api/round/check", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ version: roundTable.version, csv: document.getElementById("errataCsvText").value }) });
+    roundErrata = { check: chk };
+    document.getElementById("errataCheck").innerHTML = checkHtml(chk, "errata");
+  } catch (e) {
+    document.getElementById("errataCheck").innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+  }
+}
+
+async function doRoundErrata() {
+  let totals;
+  try { totals = readTotals("errata", roundErrata.check.land_classes); }
+  catch (e) { return setMsg("roundMsg", "warn", e.message); }
+  try {
+    const r = await api(`/api/round/${roundTable.version}/errata`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ csv: document.getElementById("errataCsvText").value, totals }) });
+    roundTable = r;
+    roundErrata = null;
+    setMsg("roundMsg", "ok", `勘误完成：${r.changed_cells} 格改动，锁定行保留原数。`);
+    renderRound();
+  } catch (e) { setMsg("roundMsg", "err", e.message + "\n（原明细与整数表保持不变）"); }
+}
+
+async function toggleLock(idx) {
+  const row = roundTable.rows[idx];
+  const expected = {};
+  roundTable.land_classes.forEach(c => { expected[c] = row.cells[c].int; });
+  try {
+    roundTable = await api(`/api/round/${roundTable.version}/lock`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parcel_id: row.parcel_id, locked: !row.locked, expected }) });
+    setMsg("roundMsg", "ok", `宗地 ${row.parcel_id} 已${row.locked ? "解锁" : "锁定"}。`);
+    renderRound();
+  } catch (e) {
+    if (e.status === 409) {
+      setMsg("roundMsg", "err", e.message + "（页面已刷新为最新整数表）");
+      await openRoundVersion(roundTable.version);
+    } else {
+      setMsg("roundMsg", "err", e.message);
+    }
+  }
+}
+
+function downloadRound() {
+  window.location.assign(`/api/round/${roundTable.version}/download`);
+}
+
+refreshState().catch(() => {});</script>
 </body>
 </html>
